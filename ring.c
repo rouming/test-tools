@@ -60,208 +60,107 @@ enum {
 	ALL        = (SIGNALED | READING | WRITING)
 };
 
+struct user_epitem {
+	unsigned events;
+	struct epoll_event event;
+};
+
 struct user_header {
 	unsigned magic;
 	unsigned header_length; /* length of the header */
-	unsigned bitmap_length; /* length of the bitmap */
-	unsigned ring_length;   /* length of the events ring */
+	unsigned items_length;  /* length of the items array */
+	unsigned index_length;  /* length of the index ring */
 	unsigned nr;            /* number of ep items */
 	unsigned head;          /* updated by userland */
 	unsigned tail;          /* updated by kernel */
 	unsigned padding;
 
-	unsigned long long bitmap[] __cacheline_aligned;
-};
-
-struct user_event {
-	unsigned bit;
-	struct epoll_event event;
+	struct user_epitem items[] __cacheline_aligned;
 };
 
 struct ring {
 	struct user_header *user_header;
-	struct user_event  *user_events;
+	unsigned           *user_itemsindex;
 
 	unsigned nr;
 	unsigned cntr;
 	unsigned commit_cntr;
 };
 
-#define BITMASK_BITS 64
-#define BITMASK_SHIFT (64 > BITMASK_BITS ?				\
-		       (6 - (__builtin_ffs(BITMASK_BITS) - 1)) :	\
-		       ((__builtin_ffs(BITMASK_BITS) - 1) - 6))
-
-static inline unsigned long long idx_to_bitmask(unsigned idx, unsigned state)
+static inline void add_event__kernel(struct ring *ring, unsigned bit)
 {
-#if BITMASK_BITS < 32
-	return (unsigned long long)state <<
-		(((idx & ((1ull << BITMASK_BITS)-1)) * (64 > BITMASK_BITS ? BITMASK_BITS : 0)));
-#else
-	return (unsigned long long)state << (idx * (64 > BITMASK_BITS ? BITMASK_BITS : 0));
-#endif
-}
+	unsigned i, *item_idx;
 
-static inline unsigned long long *bitmap_word(unsigned long long *bitmap,
-					      unsigned bit)
-{
-#if BITMASK_BITS < 64
-	return &bitmap[bit >> BITMASK_SHIFT];
-#else
-	return &bitmap[bit << BITMASK_SHIFT];
-#endif
-}
-
-static inline struct user_event *add_event__kernel(struct ring *ring,
-						   unsigned bit,
-						   struct epoll_event *event)
-{
-	struct user_event *uev;
-
-	unsigned long long *pbm, mask, bm, old, new;
-	unsigned i;
-
-	i = __atomic_add_fetch(&ring->cntr, 1, __ATOMIC_RELAXED) - 1;
-	uev = &ring->user_events[i % ring->nr];
+	i = __atomic_add_fetch(&ring->cntr, 1, __ATOMIC_ACQUIRE) - 1;
+	item_idx = &ring->user_itemsindex[i % ring->nr];
 
 	/* Update data */
-	uev->bit = bit;
-	uev->event = *event;
-
-	pbm = bitmap_word(ring->user_header->bitmap, bit);
-	mask = idx_to_bitmask(bit, ALL);
+	*item_idx = bit;
 
 	/*
-	 * Switch from any to SIGNALED, if fail - another bit update in progress
-	 */
-	bm = *pbm;
-	do {
-		old = bm;
-		new = (old & ~mask) | idx_to_bitmask(bit, SIGNALED);
-
-	} while ((bm = __sync_val_compare_and_swap(pbm, old, new)) != old);
-
-	/*
-	 * Wait for other commits in front of us and then commit our event.
-	 * We can't spin on ->tail directly, because this chunk of memory is
-	 * not controlled by the kernel, thus userspace can hang kernel by
-	 * writing garbage to ->tail.
+	 * Wait for other commits in front of us to happen and then commit
+	 * our index update.  We can't spin on ->tail directly, because this
+	 * chunk of memory is not controlled by the kernel, thus userspace
+	 * can hang kernel by writing garbage to ->tail.
 	 */
 	while (__sync_val_compare_and_swap(&ring->commit_cntr, i, i + 1) != i)
 		;
 
-	/* Now it is safe to propagate event to userspace, order does not matter */
-	__atomic_add_fetch(&ring->user_header->tail, 1, __ATOMIC_RELAXED);
-
-	return uev;
+	/* Now it is safe to propagate event to userspace */
+	__atomic_add_fetch(&ring->user_header->tail, 1, __ATOMIC_RELEASE);
 }
 
 static inline bool read_event__user(struct ring *ring, unsigned idx,
 				    struct epoll_event *event)
 {
-	unsigned long long *pbm, mask, bm, old, new;
-	struct user_event *uev;
-	unsigned bit;
+	struct user_epitem *item;
+	unsigned item_idx;
 
-	uev = &ring->user_events[idx % ring->nr];
-	bit = uev->bit;
+	item_idx = ring->user_itemsindex[idx % ring->nr];
+	/* XXX Check item_idx */
+	item = &ring->user_header->items[item_idx];
 
-	//XXX proper bit overflow check is required
-	assert(bit < (4096 - sizeof(struct user_header)) * 8);
+	/*
+	 * Fetch data first, if event is cleared by the kernel we drop the data
+	 * returning false.
+	 */
+	event->data = item->event.data;
+	event->events = __sync_lock_test_and_set(&item->events, 0);
 
-	pbm = bitmap_word(ring->user_header->bitmap, bit);
-	mask = idx_to_bitmask(bit, ALL);
-
-	bm = *pbm;
-	do {
-		if (!(bm & idx_to_bitmask(bit, SIGNALED)))
-			/* Freed? */
-			return false;
-
-		old = (bm & ~mask) | idx_to_bitmask(bit, SIGNALED);
-		new = (bm & ~mask) | idx_to_bitmask(bit, READING);
-
-		/* Switch from SIGNALED to READING, if fail - writer in progress */
-		if ((bm = __sync_val_compare_and_swap(pbm, old, new)) != old)
-			continue;
-
-		*event = uev->event;
-
-		/* Switch from READING to UNSIGNALED, if fail - writer in progress */
-		do {
-			old = (bm & ~mask) | idx_to_bitmask(bit, READING);
-			new = (bm & ~mask) | idx_to_bitmask(bit, UNSIGNALED);
-		} while ((bm = __sync_val_compare_and_swap(pbm, old, new)) != old &&
-			 (bm & mask) == idx_to_bitmask(bit, READING));
-
-	} while (bm != old);
-
-	return true;
+	return !!event->events;
 }
 
-static inline bool update_event__kernel(struct ring *ring, unsigned bit,
-					struct user_event *uev, int events)
+static inline bool update_event__kernel(struct ring *ring, unsigned idx,
+					int events)
 {
-	unsigned long long *pbm, mask, bm, old, new;
+	struct user_epitem *item;
 
-	pbm = bitmap_word(ring->user_header->bitmap, bit);
-	mask = idx_to_bitmask(bit, ALL);
+	/* XXX Check item_idx */
+	item = &ring->user_header->items[idx];
 
-	/*
-	 * Switch from any to WRITING, if fail - another bit update in progress
-	 */
-	bm = *pbm;
-	do {
-		if ((bm & mask) == idx_to_bitmask(bit, UNSIGNALED))
-			/* Unsignaled, freed by user */
-			return false;
-		old = bm;
-		new = (old & ~mask) | idx_to_bitmask(bit, WRITING);
+	assert(sizeof(struct user_epitem) == 16);
+	assert(!((uintptr_t)item & 15));
+	assert(!((uintptr_t)&item->events & 15));
 
-	} while ((bm = __sync_val_compare_and_swap(pbm, old, new)) != old);
-
-	/* Here we are sure userland waits for us to finish events update */
-	uev->event.events |= events;
-
-	/*
-	 * Switch from any to SIGNALED, if fail - another bit update in progress,
-	 * reader should not come in-between.
-	 */
-	bm = *pbm;
-	do {
-		old = bm;
-		new = (old & ~mask) | idx_to_bitmask(bit, SIGNALED);
-
-	} while ((bm = __sync_val_compare_and_swap(pbm, old, new)) != old);
-
-	return true;
+	return !!__atomic_fetch_or(&item->events, events, __ATOMIC_ACQUIRE);
 }
 
 static inline void free_event__kernel(struct ring *ring, unsigned idx)
 {
-	unsigned long long *pbm, mask, bm, old, new;
+	struct user_epitem *item;
+	unsigned item_idx;
 
-	pbm = bitmap_word(ring->user_header->bitmap, idx);
-	mask = idx_to_bitmask(idx, ALL);
+	item_idx = ring->user_itemsindex[idx % ring->nr];
+	/* XXX Check item_idx */
+	item = &ring->user_header->items[item_idx];
 
-	/*
-	 * Switch from any to UNSIGNALED, if fail - another bit update in progress
-	 */
-	bm = *pbm;
-	do {
-		if ((bm & mask) == idx_to_bitmask(idx, UNSIGNALED))
-			/* Unsignaled, freed by user */
-			return;
-		old = bm;
-		new = (old & ~mask) | idx_to_bitmask(idx, UNSIGNALED);
-
-	} while ((bm = __sync_val_compare_and_swap(pbm, old, new)) != old);
+	__sync_lock_test_and_set(&item->events, 0);
 }
 
 
 #define ITERS 10000000ull
-//#define THRDS 16
-#define THRDS 256
+#define THRDS 16
+//#define THRDS 256
 
 
 struct uepollfd {
@@ -273,7 +172,6 @@ struct ueventfd {
 	struct uepollfd    *epfd;
 	unsigned           efd_bit;
 	struct epoll_event event;
-	struct user_event  *uev;
 };
 
 struct thread_ctx {
@@ -287,10 +185,10 @@ static volatile int start;
 
 static inline unsigned long long nsecs(void)
 {
-    struct timespec ts = {0, 0};
+	struct timespec ts = {0, 0};
 
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ((unsigned long long)ts.tv_sec * 1000000000ull) + ts.tv_nsec;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((unsigned long long)ts.tv_sec * 1000000000ull) + ts.tv_nsec;
 }
 
 static void uepoll_create(struct uepollfd *epfd)
@@ -301,9 +199,9 @@ static void uepoll_create(struct uepollfd *epfd)
 	assert(epfd->ring.user_header);
 	memset(epfd->ring.user_header, 0, 4096);
 
-	epfd->ring.user_events = aligned_alloc(L1_CACHE_BYTES, 4096);
-	assert(epfd->ring.user_events);
-	memset(epfd->ring.user_events, 0, 4096);
+	epfd->ring.user_itemsindex = aligned_alloc(L1_CACHE_BYTES, 4096);
+	assert(epfd->ring.user_itemsindex);
+	memset(epfd->ring.user_itemsindex, 0, 4096);
 }
 
 static void uepoll_ctl(struct uepollfd *epfd, int op, struct ueventfd *efd,
@@ -311,6 +209,7 @@ static void uepoll_ctl(struct uepollfd *epfd, int op, struct ueventfd *efd,
 
 {
 	struct ring *ring = &epfd->ring;
+	struct user_epitem *item;
 
 	assert(op == EPOLL_CTL_ADD);
 	/* No pending events so far */
@@ -322,6 +221,11 @@ static void uepoll_ctl(struct uepollfd *epfd, int op, struct ueventfd *efd,
 	efd->event = *event;
 
 	ring->user_header->nr = epfd->ring.nr;
+
+	/* That is racy with possible access from userspace, but we do not care */
+	item = &ring->user_header->items[efd->efd_bit];
+	item->event = *event;
+	item->events = 0;
 }
 
 static int uepoll_wait(struct uepollfd *epfd, struct epoll_event *events,
@@ -329,7 +233,7 @@ static int uepoll_wait(struct uepollfd *epfd, struct epoll_event *events,
 
 {
 	struct ring *ring = &epfd->ring;
-	struct user_header *uheader = ring->user_header;
+	struct user_header *header = ring->user_header;
 	unsigned tail;
 	int i;
 
@@ -337,17 +241,20 @@ static int uepoll_wait(struct uepollfd *epfd, struct epoll_event *events,
 
 	/*
 	 * Cache the tail because we don't want refetch it on each iteration
-	 * and then catch live events updates, i.e. we don't want events array
-	 * consist of events from same fds.
+	 * and then catch live events updates, i.e. we don't want user @events
+	 * array consist of events from the same fds.
 	 */
-	tail = READ_ONCE(uheader->tail);
+	tail = READ_ONCE(header->tail);
 
-	if (uheader->head >= tail)
+	if (header->head >= tail)
 		return -EAGAIN;
 
-	for (i = 0; uheader->head < tail && i < maxevents; uheader->head++) {
-		if (read_event__user(ring, uheader->head, &events[i]))
+	for (i = 0; header->head < tail && i < maxevents; header->head++) {
+		if (read_event__user(ring, header->head, &events[i]))
 			i++;
+		else
+			/* Currently we do not support event cleared by kernel */
+			assert(0);
 	}
 
 	return i;
@@ -364,13 +271,8 @@ static void uepoll_signal(struct ueventfd *efd, int events)
 
 	ring = &efd->epfd->ring;
 
-	if (efd->uev) {
-		if (update_event__kernel(ring, efd->efd_bit, efd->uev, events))
-			/* User event was successfully updated, keep the uev pointer */
-			return;
-	}
-	efd->event.events |= events;
-	efd->uev = add_event__kernel(ring, efd->efd_bit, &efd->event);
+	if (!update_event__kernel(ring, efd->efd_bit, events))
+		add_event__kernel(ring, efd->efd_bit);
 }
 
 static void ueventfd_create(struct ueventfd *efd, unsigned long long count)
@@ -517,88 +419,3 @@ end:
 
 	return 0;
 }
-
-
-//////////////
-
-#if 0
-
-static unsigned long long idx_to_bitmask(unsigned idx, unsigned state)
-{
-	return (unsigned long long)state << ((idx & 0x3f) << 2);
-}
-
-enum {
-	UNSIGNALED = 0,
-	SIGNALED   = 1,
-	READING    = 2,
-	WRITING    = 4,
-
-	ALL        = (SIGNALED | READING | WRITING)
-};
-
-static inline bool read_event(struct ring *ring, unsigned idx,
-			      struct event *event)
-{
-	unsigned long long *pbm, mask, bm, old, new;
-
-	/* Quarter of 64, since we have 4 bits for the state */
-	pbm = bitmap_word(ring->bitmap, idx);
-	mask = idx_to_bitmask(idx, ALL);
-
-	bm = *pbm;
-	do {
-		if (!(bm & mask))
-			/* Freed? */
-			return false;
-
-		/* Switch to READING. */
-		set_bit(pbm, XXX);
-		smp_mb();
-
-		bm = *pbm;
-		if (bm & idx_to_bitmask(idx, WRITING))
-			/* Busy loop, wait for writer go away */
-			continue;
-
-		*event = ring->events[idx];
-
-		old = (bm & ~mask) | idx_to_bitmask(idx, READING | SIGNALED);
-		new = (bm & ~mask) | idx_to_bitmask(idx, UNSIGNALED);
-
-		/* Switch from READING to UNSIGNALED, if fail - writer in progress */
-	} while ((bm = __sync_val_compare_and_swap(pbm, old, new)) != old);
-
-	return true;
-}
-
-static inline void update_event(struct ring *ring, unsigned idx,
-				struct event *event)
-{
-	unsigned long long *pbm, mask, old, new;
-
-	pbm = bitmap_word(ring->bitmap, idx);
-
-	/*
-	 * Switch from any to WRITING, if fail - another bit update in progress
-	 */
-	bm = *pbm;
-	do {
-		if (!(bm & idx_to_bitmask(idx, SIGNALED)))
-			/* Already freed */
-			return false;
-		old = bm;
-		new = (bm & ~mask) | idx_to_bitmask(idx, WRITING | SIGNALED);
-	} while ((bm = __sync_val_compare_and_swap(pbm, old, new)) != old);
-
-	/* Clear possible reader, order with WRITING bit set above is crucial  */
-	clear_bit(pbm, XXX);
-
-	ring->events[idx] = *event;
-
-	smp_wmb();
-
-	/* Clear previously set WRITING. */
-	clear_bit(pbm, XXX);
-}
-#endif
