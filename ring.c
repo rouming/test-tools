@@ -19,7 +19,7 @@
  *
  *  Purpose of the tool is to emulate eventfd and epoll_wait in userspace.
  *
- *  $ gcc -o ring ring.c -O2 -lpthread
+ *  $ gcc -o ring ring.c -O2 -Wall -lpthread
  *
  */
 
@@ -48,7 +48,9 @@ enum {
 
 #define READ_ONCE(v) (*(volatile typeof(v)*)&v)
 
-#define L1_CACHE_BYTES 128
+#define rmb()	asm volatile("lfence":::"memory")
+
+#define L1_CACHE_BYTES 64
 #define __cacheline_aligned __attribute__((__aligned__(L1_CACHE_BYTES)))
 
 enum {
@@ -89,25 +91,27 @@ struct ring {
 
 static inline void add_event__kernel(struct ring *ring, unsigned bit)
 {
-	unsigned i, *item_idx;
+	unsigned i, cntr, commit_cntr, *item_idx, tail, old;
 
-	i = __atomic_add_fetch(&ring->cntr, 1, __ATOMIC_ACQUIRE) - 1;
+	i = __atomic_fetch_add(&ring->cntr, 1, __ATOMIC_ACQUIRE);
 	item_idx = &ring->user_itemsindex[i % ring->nr];
 
 	/* Update data */
 	*item_idx = bit;
 
-	/*
-	 * Wait for other commits in front of us to happen and then commit
-	 * our index update.  We can't spin on ->tail directly, because this
-	 * chunk of memory is not controlled by the kernel, thus userspace
-	 * can hang kernel by writing garbage to ->tail.
-	 */
-	while (__sync_val_compare_and_swap(&ring->commit_cntr, i, i + 1) != i)
-		;
+	commit_cntr = __atomic_add_fetch(&ring->commit_cntr, 1, __ATOMIC_RELEASE);
 
-	/* Now it is safe to propagate event to userspace */
-	__atomic_add_fetch(&ring->user_header->tail, 1, __ATOMIC_RELEASE);
+	tail = ring->user_header->tail;
+	rmb();
+	do {
+		cntr = ring->cntr;
+		if (cntr != commit_cntr)
+			/* Someone else will advance tail */
+			break;
+
+		old = tail;
+
+	} while ((tail = __sync_val_compare_and_swap(&ring->user_header->tail, old, cntr)) != old);
 }
 
 static inline bool read_event__user(struct ring *ring, unsigned idx,
@@ -159,8 +163,7 @@ static inline void free_event__kernel(struct ring *ring, unsigned idx)
 
 
 #define ITERS 10000000ull
-#define THRDS 16
-//#define THRDS 256
+#define THRDS 256
 
 
 struct uepollfd {
@@ -193,15 +196,17 @@ static inline unsigned long long nsecs(void)
 
 static void uepoll_create(struct uepollfd *epfd)
 {
+	const size_t size = 4<<12;
+
 	memset(epfd, 0, sizeof(*epfd));
 
-	epfd->ring.user_header = aligned_alloc(L1_CACHE_BYTES, 4096);
+	epfd->ring.user_header = aligned_alloc(L1_CACHE_BYTES, size);
 	assert(epfd->ring.user_header);
-	memset(epfd->ring.user_header, 0, 4096);
+	memset(epfd->ring.user_header, 0, size);
 
-	epfd->ring.user_itemsindex = aligned_alloc(L1_CACHE_BYTES, 4096);
+	epfd->ring.user_itemsindex = aligned_alloc(L1_CACHE_BYTES, size);
 	assert(epfd->ring.user_itemsindex);
-	memset(epfd->ring.user_itemsindex, 0, 4096);
+	memset(epfd->ring.user_itemsindex, 0, size);
 }
 
 static void uepoll_ctl(struct uepollfd *epfd, int op, struct ueventfd *efd,
@@ -246,10 +251,10 @@ static int uepoll_wait(struct uepollfd *epfd, struct epoll_event *events,
 	 */
 	tail = READ_ONCE(header->tail);
 
-	if (header->head >= tail)
+	if (header->head == tail)
 		return -EAGAIN;
 
-	for (i = 0; header->head < tail && i < maxevents; header->head++) {
+	for (i = 0; header->head != tail && i < maxevents; header->head++) {
 		if (read_event__user(ring, header->head, &events[i]))
 			i++;
 		else
@@ -315,7 +320,7 @@ static int ueventfd_write(struct ueventfd *efd, unsigned long long count)
 	if (count == ULLONG_MAX)
 		return -EINVAL;
 
-	__atomic_add_fetch(&efd->count, count, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&efd->count, count, __ATOMIC_RELAXED);
 
 #else
 	c = efd->count;
@@ -338,7 +343,7 @@ static void *thread_work(void *arg)
 	uint64_t ucnt = 1;
 	int i, rc;
 
-	__atomic_add_fetch(&thr_ready, 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&thr_ready, 1, __ATOMIC_RELAXED);
 
 	while (!start)
 		;
