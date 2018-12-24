@@ -85,44 +85,34 @@ struct ring {
 	unsigned           *user_itemsindex;
 
 	unsigned nr;
-	unsigned cntr;
-	unsigned commit_cntr;
 };
 
 static inline void add_event__kernel(struct ring *ring, unsigned bit)
 {
-	unsigned i, cntr, commit_cntr, *item_idx, tail, old;
+	unsigned i, *item_idx;
 
-	i = __atomic_fetch_add(&ring->cntr, 1, __ATOMIC_ACQUIRE);
+	i = __atomic_fetch_add(&ring->user_header->tail, 1, __ATOMIC_ACQUIRE);
 	item_idx = &ring->user_itemsindex[i % ring->nr];
 
 	/* Update data */
-	*item_idx = bit;
-
-	commit_cntr = __atomic_add_fetch(&ring->commit_cntr, 1, __ATOMIC_RELEASE);
-
-	tail = ring->user_header->tail;
-	rmb();
-	do {
-		cntr = ring->cntr;
-		if (cntr != commit_cntr)
-			/* Someone else will advance tail */
-			break;
-
-		old = tail;
-
-	} while ((tail = __sync_val_compare_and_swap(&ring->user_header->tail, old, cntr)) != old);
+	__atomic_store_n(item_idx, bit + 1, __ATOMIC_RELEASE);
 }
 
 static inline bool read_event__user(struct ring *ring, unsigned idx,
 				    struct epoll_event *event)
 {
 	struct user_epitem *item;
-	unsigned item_idx;
+	unsigned *item_idx;
 
-	item_idx = ring->user_itemsindex[idx % ring->nr];
+	item_idx = &ring->user_itemsindex[idx % ring->nr];
+
+	while (!(idx = __atomic_load_n(item_idx, __ATOMIC_RELAXED)))
+		;
+
 	/* XXX Check item_idx */
-	item = &ring->user_header->items[item_idx];
+	item = &ring->user_header->items[idx - 1];
+
+	*item_idx = 0;
 
 	/*
 	 * Fetch data first, if event is cleared by the kernel we drop the data
