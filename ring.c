@@ -44,15 +44,15 @@ enum {
 };
 #endif
 
-
-
+#define BUILD_BUG_ON(condition) ((void )sizeof(char [1 - 2*!!(condition)]))
 #define READ_ONCE(v) (*(volatile typeof(v)*)&(v))
 
-#define rmb()	asm volatile("lfence":::"memory")
-#define wmb()	asm volatile("sfence":::"memory")
+#define smp_rmb() asm volatile("lfence":::"memory")
+#define smp_wmb() asm volatile("sfence":::"memory")
 
-#define L1_CACHE_BYTES 64
-#define __cacheline_aligned __attribute__((__aligned__(L1_CACHE_BYTES)))
+#define EPOLL_USER_HEADER_SIZE  128
+#define EPOLL_USER_HEADER_MAGIC 0xf00dce11
+
 
 enum {
 	UNSIGNALED = 0,
@@ -63,23 +63,34 @@ enum {
 	ALL        = (SIGNALED | READING | WRITING)
 };
 
+enum {
+	EPOLL_USER_POLL_INACTIVE = 0, /* busy poll is inactive, call epoll_wait() */
+	EPOLL_USER_POLL_ACTIVE   = 1, /* user can continue busy polling */
+};
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic warning "-Wpadded"
+
 struct user_epitem {
-	unsigned events;
+	unsigned active_events;
 	struct epoll_event event;
 };
 
 struct user_header {
-	unsigned magic;
-	unsigned header_length; /* length of the header */
-	unsigned items_length;  /* length of the items array */
-	unsigned index_length;  /* length of the index ring */
-	unsigned items_nr;      /* number of ep items */
-	unsigned indeces_nr;    /* number of items indeces */
-	unsigned head;          /* updated by userland */
-	unsigned tail;          /* updated by kernel */
+	unsigned magic;          /* epoll user header magic */
+	unsigned state;          /* epoll ring state */
+	unsigned header_length;  /* length of the header + items */
+	unsigned index_length;   /* length of the index ring */
+	unsigned items_nr;       /* number of ep items */
+	unsigned indeces_nr;     /* number of items indeces */
+	unsigned head;           /* updated by userland */
+	unsigned tail;           /* updated by kernel */
+	unsigned padding[24];    /* Header size is 128 bytes */
 
-	struct user_epitem items[] __cacheline_aligned;
+	struct user_epitem items[];
 };
+
+#pragma GCC diagnostic pop
 
 struct ring {
 	struct user_header *user_header;
@@ -98,9 +109,9 @@ static inline bool update_event__kernel(struct ring *ring, unsigned bit,
 
 	assert(sizeof(struct user_epitem) == 16);
 	assert(!((uintptr_t)item & 15));
-	assert(!((uintptr_t)&item->events & 15));
+	assert(!((uintptr_t)&item->active_events & 15));
 
-	return !!__atomic_fetch_or(&item->events, events, __ATOMIC_ACQUIRE);
+	return !!__atomic_fetch_or(&item->active_events, events, __ATOMIC_ACQUIRE);
 }
 
 static inline void add_event__kernel(struct ring *ring, unsigned bit)
@@ -127,17 +138,18 @@ static inline bool free_event__kernel(struct ring *ring, unsigned bit)
 
 	item = &ring->user_header->items[bit];
 
-	return !__atomic_exchange_n(&item->events, 0, __ATOMIC_RELAXED);
+	return !__atomic_exchange_n(&item->active_events, 0, __ATOMIC_RELAXED);
 }
 
 
 static inline bool read_event__user(struct ring *ring, unsigned idx,
 				    struct epoll_event *event)
 {
+	struct user_header *header = ring->user_header;
 	struct user_epitem *item;
 	unsigned *item_idx_ptr;
 
-	item_idx_ptr = &ring->user_itemsindex[idx % ring->indeces_nr];
+	item_idx_ptr = &ring->user_itemsindex[idx % header->indeces_nr];
 
 	/*
 	 * Spin here till we see valid index
@@ -145,11 +157,11 @@ static inline bool read_event__user(struct ring *ring, unsigned idx,
 	while (!(idx = __atomic_load_n(item_idx_ptr, __ATOMIC_ACQUIRE)))
 		;
 
-	if (idx > ring->items_nr)
+	if (idx > header->items_nr)
 		/* Corrupted index? */
 		return false;
 
-	item = &ring->user_header->items[idx - 1];
+	item = &header->items[idx - 1];
 
 	/*
 	 * Mark index as invalid, that is for userspace only, kernel does not care
@@ -163,7 +175,8 @@ static inline bool read_event__user(struct ring *ring, unsigned idx,
 	 * returning false.
 	 */
 	event->data = item->event.data;
-	event->events = __atomic_exchange_n(&item->events, 0, __ATOMIC_RELEASE);
+	event->events = __atomic_exchange_n(&item->active_events, 0,
+					    __ATOMIC_RELEASE);
 
 	return !!event->events;
 }
@@ -207,11 +220,16 @@ static void uepoll_create(struct uepollfd *epfd)
 
 	memset(epfd, 0, sizeof(*epfd));
 
-	epfd->ring.user_header = aligned_alloc(L1_CACHE_BYTES, size);
+	BUILD_BUG_ON(sizeof(*epfd->ring.user_header) != EPOLL_USER_HEADER_SIZE);
+
+	epfd->ring.user_header = aligned_alloc(EPOLL_USER_HEADER_SIZE, size);
 	assert(epfd->ring.user_header);
 	memset(epfd->ring.user_header, 0, size);
 
-	epfd->ring.user_itemsindex = aligned_alloc(L1_CACHE_BYTES, size);
+	epfd->ring.user_header->magic = EPOLL_USER_HEADER_MAGIC;
+	epfd->ring.user_header->state = EPOLL_USER_POLL_ACTIVE;
+
+	epfd->ring.user_itemsindex = aligned_alloc(EPOLL_USER_HEADER_SIZE, size);
 	assert(epfd->ring.user_itemsindex);
 	memset(epfd->ring.user_itemsindex, 0, size);
 }
@@ -239,8 +257,8 @@ static void uepoll_ctl(struct uepollfd *epfd, int op, struct ueventfd *efd,
 
 	/* That is racy with possible access from userspace, but we do not care */
 	item = &ring->user_header->items[efd->efd_bit];
+	item->active_events = 0;
 	item->event = *event;
-	item->events = 0;
 }
 
 static int uepoll_wait(struct uepollfd *epfd, struct epoll_event *events,
@@ -252,6 +270,7 @@ static int uepoll_wait(struct uepollfd *epfd, struct epoll_event *events,
 	unsigned tail;
 	int i;
 
+	BUILD_BUG_ON(sizeof(*header) != EPOLL_USER_HEADER_SIZE);
 	assert(maxevents > 0);
 
 	/*
@@ -261,8 +280,11 @@ static int uepoll_wait(struct uepollfd *epfd, struct epoll_event *events,
 	 */
 	tail = READ_ONCE(header->tail);
 
-	if (header->head == tail)
+	if (header->head == tail) {
+		if (header->state != EPOLL_USER_POLL_ACTIVE)
+			return -ECANCELED;
 		return -EAGAIN;
+	}
 
 	for (i = 0; header->head != tail && i < maxevents; header->head++) {
 		if (read_event__user(ring, header->head, &events[i]))
