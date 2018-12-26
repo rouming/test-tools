@@ -46,9 +46,10 @@ enum {
 
 
 
-#define READ_ONCE(v) (*(volatile typeof(v)*)&v)
+#define READ_ONCE(v) (*(volatile typeof(v)*)&(v))
 
 #define rmb()	asm volatile("lfence":::"memory")
+#define wmb()	asm volatile("sfence":::"memory")
 
 #define L1_CACHE_BYTES 64
 #define __cacheline_aligned __attribute__((__aligned__(L1_CACHE_BYTES)))
@@ -72,10 +73,10 @@ struct user_header {
 	unsigned header_length; /* length of the header */
 	unsigned items_length;  /* length of the items array */
 	unsigned index_length;  /* length of the index ring */
-	unsigned nr;            /* number of ep items */
+	unsigned items_nr;      /* number of ep items */
+	unsigned indeces_nr;    /* number of items indeces */
 	unsigned head;          /* updated by userland */
 	unsigned tail;          /* updated by kernel */
-	unsigned padding;
 
 	struct user_epitem items[] __cacheline_aligned;
 };
@@ -84,53 +85,16 @@ struct ring {
 	struct user_header *user_header;
 	unsigned           *user_itemsindex;
 
-	unsigned nr;
+	unsigned items_nr;
+	unsigned indeces_nr;
 };
 
-static inline void add_event__kernel(struct ring *ring, unsigned bit)
-{
-	unsigned i, *item_idx;
-
-	i = __atomic_fetch_add(&ring->user_header->tail, 1, __ATOMIC_ACQUIRE);
-	item_idx = &ring->user_itemsindex[i % ring->nr];
-
-	/* Update data */
-	__atomic_store_n(item_idx, bit + 1, __ATOMIC_RELEASE);
-}
-
-static inline bool read_event__user(struct ring *ring, unsigned idx,
-				    struct epoll_event *event)
-{
-	struct user_epitem *item;
-	unsigned *item_idx;
-
-	item_idx = &ring->user_itemsindex[idx % ring->nr];
-
-	while (!(idx = __atomic_load_n(item_idx, __ATOMIC_RELAXED)))
-		;
-
-	/* XXX Check item_idx */
-	item = &ring->user_header->items[idx - 1];
-
-	*item_idx = 0;
-
-	/*
-	 * Fetch data first, if event is cleared by the kernel we drop the data
-	 * returning false.
-	 */
-	event->data = item->event.data;
-	event->events = __sync_lock_test_and_set(&item->events, 0);
-
-	return !!event->events;
-}
-
-static inline bool update_event__kernel(struct ring *ring, unsigned idx,
+static inline bool update_event__kernel(struct ring *ring, unsigned bit,
 					int events)
 {
 	struct user_epitem *item;
 
-	/* XXX Check item_idx */
-	item = &ring->user_header->items[idx];
+	item = &ring->user_header->items[bit];
 
 	assert(sizeof(struct user_epitem) == 16);
 	assert(!((uintptr_t)item & 15));
@@ -139,16 +103,69 @@ static inline bool update_event__kernel(struct ring *ring, unsigned idx,
 	return !!__atomic_fetch_or(&item->events, events, __ATOMIC_ACQUIRE);
 }
 
-static inline void free_event__kernel(struct ring *ring, unsigned idx)
+static inline void add_event__kernel(struct ring *ring, unsigned bit)
+{
+	unsigned i, *item_idx;
+
+	i = __atomic_fetch_add(&ring->user_header->tail, 1, __ATOMIC_ACQUIRE);
+	item_idx = &ring->user_itemsindex[i % ring->indeces_nr];
+
+	/* Update data */
+	*item_idx = bit + 1;
+}
+
+/**
+ * free_event__kernel() - frees event from kernel side.  Returns true if event
+ * is not signaled and has been read already by userspace, thus it is safe to
+ * reuse item bit immediately.  It is not safe to reuse item bit if false is
+ * returned, bit put operation should be postponed till userspace calls epoll
+ * syscall.
+ */
+static inline bool free_event__kernel(struct ring *ring, unsigned bit)
 {
 	struct user_epitem *item;
-	unsigned item_idx;
 
-	item_idx = ring->user_itemsindex[idx % ring->nr];
-	/* XXX Check item_idx */
-	item = &ring->user_header->items[item_idx];
+	item = &ring->user_header->items[bit];
 
-	__sync_lock_test_and_set(&item->events, 0);
+	return !__atomic_exchange_n(&item->events, 0, __ATOMIC_RELAXED);
+}
+
+
+static inline bool read_event__user(struct ring *ring, unsigned idx,
+				    struct epoll_event *event)
+{
+	struct user_epitem *item;
+	unsigned *item_idx_ptr;
+
+	item_idx_ptr = &ring->user_itemsindex[idx % ring->indeces_nr];
+
+	/*
+	 * Spin here till we see valid index
+	 */
+	while (!(idx = __atomic_load_n(item_idx_ptr, __ATOMIC_ACQUIRE)))
+		;
+
+	if (idx > ring->items_nr)
+		/* Corrupted index? */
+		return false;
+
+	item = &ring->user_header->items[idx - 1];
+
+	/*
+	 * Mark index as invalid, that is for userspace only, kernel does not care
+	 * and will refill this pointer only when observes that event is cleared,
+	 * which happens below.
+	 */
+	*item_idx_ptr = 0;
+
+	/*
+	 * Fetch data first, if event is cleared by the kernel we drop the data
+	 * returning false.
+	 */
+	event->data = item->event.data;
+	event->events = __atomic_exchange_n(&item->events, 0, __ATOMIC_RELEASE);
+
+	return !!event->events;
 }
 
 
@@ -212,10 +229,13 @@ static void uepoll_ctl(struct uepollfd *epfd, int op, struct ueventfd *efd,
 	assert(efd->epfd == NULL);
 
 	efd->epfd = epfd;
-	efd->efd_bit = epfd->ring.nr++;
+	efd->efd_bit = epfd->ring.items_nr++;
 	efd->event = *event;
+	/* Currencly indeces_nr == items_nr */
+	epfd->ring.indeces_nr = epfd->ring.items_nr;
 
-	ring->user_header->nr = epfd->ring.nr;
+	ring->user_header->items_nr = epfd->ring.items_nr;
+	ring->user_header->indeces_nr = epfd->ring.indeces_nr;
 
 	/* That is racy with possible access from userspace, but we do not care */
 	item = &ring->user_header->items[efd->efd_bit];
@@ -278,11 +298,10 @@ static void ueventfd_create(struct ueventfd *efd, unsigned long long count)
 
 static int ueventfd_read(struct ueventfd *efd, unsigned long long *count)
 {
-	unsigned long long c, old;
+	unsigned long long c;
 
 	c = efd->count;
 #if 1
-	old = c;
 	if (c == 0)
 		return -EAGAIN;
 	__atomic_sub_fetch(&efd->count, c, __ATOMIC_RELAXED);
@@ -290,10 +309,10 @@ static int ueventfd_read(struct ueventfd *efd, unsigned long long *count)
 	do {
 		if (c == 0)
 			return -EAGAIN;
-		old = c;
-	} while ((c = __sync_val_compare_and_swap(&efd->count, old, 0)) != old);
+	} while (!__atomic_compare_exchange_n(&efd->count, &c, 0, false,
+					      __ATOMIC_RELAXED, __ATOMIC_RELAXED));
 #endif
-	*count = old;
+	*count = c;
 
 	uepoll_signal(efd, EPOLLOUT);
 
@@ -302,24 +321,19 @@ static int ueventfd_read(struct ueventfd *efd, unsigned long long *count)
 
 static int ueventfd_write(struct ueventfd *efd, unsigned long long count)
 {
-	unsigned long long c, old, new;
-
 #if 1
-	(void)c; (void)old; (void)new;
-
 	if (count == ULLONG_MAX)
 		return -EINVAL;
 
 	__atomic_fetch_add(&efd->count, count, __ATOMIC_RELAXED);
 
 #else
-	c = efd->count;
+	unsigned long long c = efd->count;
 	do {
 		if (ULLONG_MAX - c <= count)
 			return -EAGAIN;
-		old = c;
-		new = old + count;
-	} while ((c = __sync_val_compare_and_swap(&efd->count, old, new)) != old);
+	} while (!__atomic_compare_exchange_n(&efd->count, &c, c + count, false,
+					      __ATOMIC_RELAXED, __ATOMIC_RELAXED));
 #endif
 
 	uepoll_signal(efd, EPOLLIN);
