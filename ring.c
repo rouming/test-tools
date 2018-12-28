@@ -81,8 +81,8 @@ struct user_header {
 	unsigned state;          /* epoll ring state */
 	unsigned header_length;  /* length of the header + items */
 	unsigned index_length;   /* length of the index ring */
-	unsigned items_nr;       /* number of ep items */
-	unsigned indeces_nr;     /* number of items indeces */
+	unsigned max_items_nr;   /* max number of items slots */
+	unsigned max_indeces_nr; /* max number of items indeces, always pow2 */
 	unsigned head;           /* updated by userland */
 	unsigned tail;           /* updated by kernel */
 	unsigned padding[24];    /* Header size is 128 bytes */
@@ -97,7 +97,7 @@ struct ring {
 	unsigned           *user_itemsindex;
 
 	unsigned items_nr;
-	unsigned indeces_nr;
+	unsigned max_indeces_nr;
 };
 
 static inline bool update_event__kernel(struct ring *ring, unsigned bit,
@@ -116,10 +116,11 @@ static inline bool update_event__kernel(struct ring *ring, unsigned bit,
 
 static inline void add_event__kernel(struct ring *ring, unsigned bit)
 {
-	unsigned i, *item_idx;
+	unsigned i, *item_idx, indeces_mask;
 
+	indeces_mask = (ring->max_indeces_nr - 1);
 	i = __atomic_fetch_add(&ring->user_header->tail, 1, __ATOMIC_ACQUIRE);
-	item_idx = &ring->user_itemsindex[i % ring->indeces_nr];
+	item_idx = &ring->user_itemsindex[i & indeces_mask];
 
 	/* Update data */
 	*item_idx = bit + 1;
@@ -148,8 +149,14 @@ static inline bool read_event__user(struct ring *ring, unsigned idx,
 	struct user_header *header = ring->user_header;
 	struct user_epitem *item;
 	unsigned *item_idx_ptr;
+	unsigned indeces_mask;
 
-	item_idx_ptr = &ring->user_itemsindex[idx % header->indeces_nr];
+	indeces_mask = (header->max_indeces_nr - 1);
+	if (indeces_mask & header->max_indeces_nr)
+		/* Should be pow2, corrupted header? */
+		return false;
+
+	item_idx_ptr = &ring->user_itemsindex[idx & indeces_mask];
 
 	/*
 	 * Spin here till we see valid index
@@ -157,7 +164,7 @@ static inline bool read_event__user(struct ring *ring, unsigned idx,
 	while (!(idx = __atomic_load_n(item_idx_ptr, __ATOMIC_ACQUIRE)))
 		;
 
-	if (idx > header->items_nr)
+	if (idx > header->max_items_nr)
 		/* Corrupted index? */
 		return false;
 
@@ -216,22 +223,32 @@ static inline unsigned long long nsecs(void)
 
 static void uepoll_create(struct uepollfd *epfd)
 {
+	struct user_header *hdr;
+	unsigned *itemsindex;
 	const size_t size = 4<<12;
 
 	memset(epfd, 0, sizeof(*epfd));
 
-	BUILD_BUG_ON(sizeof(*epfd->ring.user_header) != EPOLL_USER_HEADER_SIZE);
+	BUILD_BUG_ON(sizeof(*hdr) != EPOLL_USER_HEADER_SIZE);
 
-	epfd->ring.user_header = aligned_alloc(EPOLL_USER_HEADER_SIZE, size);
-	assert(epfd->ring.user_header);
-	memset(epfd->ring.user_header, 0, size);
+	hdr = aligned_alloc(EPOLL_USER_HEADER_SIZE, size);
+	assert(hdr);
+	memset(hdr, 0, size);
 
-	epfd->ring.user_header->magic = EPOLL_USER_HEADER_MAGIC;
-	epfd->ring.user_header->state = EPOLL_USER_POLL_ACTIVE;
+	hdr->magic = EPOLL_USER_HEADER_MAGIC;
+	hdr->state = EPOLL_USER_POLL_ACTIVE;
+	hdr->header_length = size;
+	hdr->index_length = size;
+	hdr->max_items_nr = (size - sizeof(*hdr)) / sizeof(hdr->items[0]);
+	hdr->max_indeces_nr = size / sizeof(*itemsindex);
 
-	epfd->ring.user_itemsindex = aligned_alloc(EPOLL_USER_HEADER_SIZE, size);
-	assert(epfd->ring.user_itemsindex);
-	memset(epfd->ring.user_itemsindex, 0, size);
+	itemsindex = aligned_alloc(EPOLL_USER_HEADER_SIZE, size);
+	assert(itemsindex);
+	memset(itemsindex, 0, size);
+
+	epfd->ring.user_header = hdr;
+	epfd->ring.user_itemsindex = itemsindex;
+	epfd->ring.max_indeces_nr = hdr->max_indeces_nr;
 }
 
 static void uepoll_ctl(struct uepollfd *epfd, int op, struct ueventfd *efd,
@@ -249,11 +266,6 @@ static void uepoll_ctl(struct uepollfd *epfd, int op, struct ueventfd *efd,
 	efd->epfd = epfd;
 	efd->efd_bit = epfd->ring.items_nr++;
 	efd->event = *event;
-	/* Currencly indeces_nr == items_nr */
-	epfd->ring.indeces_nr = epfd->ring.items_nr;
-
-	ring->user_header->items_nr = epfd->ring.items_nr;
-	ring->user_header->indeces_nr = epfd->ring.indeces_nr;
 
 	/* That is racy with possible access from userspace, but we do not care */
 	item = &ring->user_header->items[efd->efd_bit];
