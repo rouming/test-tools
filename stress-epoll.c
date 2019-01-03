@@ -20,7 +20,7 @@
  *  Purpose of the tool is to generate N events from different threads and to
  *  measure how fast those events will be delivered to thread which does epoll.
  *
- *  $ gcc -o stress-epoll stress-epoll.c -O2 -lpthread
+ *  $ gcc -o stress-epoll stress-epoll.c -O2 -lpthread -lnuma
  *
  */
 
@@ -35,6 +35,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <err.h>
+#include <numa.h>
 
 #define ITERS     1000000ull
 
@@ -43,8 +44,62 @@ struct thread_ctx {
 	int efd;
 };
 
+struct cpu_map {
+	unsigned int nr;
+	unsigned int map[];
+};
+
 static volatile unsigned int thr_ready;
 static volatile unsigned int start;
+
+static int is_cpu_online(int cpu)
+{
+	char buf[64];
+	char online;
+	FILE *f;
+	int rc;
+
+	snprintf(buf, sizeof(buf), "/sys/devices/system/cpu/cpu%d/online", cpu);
+	f = fopen(buf, "r");
+	if (!f)
+		return 1;
+
+	rc = fread(&online, 1, 1, f);
+	assert(rc == 1);
+	fclose(f);
+
+	return (char)online == '1';
+}
+
+static struct cpu_map *cpu_map__new(void)
+{
+	struct cpu_map *cpu;
+	struct bitmask *bm;
+
+	int i, bit, cpus_nr;
+
+	cpus_nr = numa_num_possible_cpus();
+	cpu = calloc(1, sizeof(*cpu) + sizeof(cpu->map[0]) * cpus_nr);
+	if (!cpu)
+		return NULL;
+
+	bm = numa_all_cpus_ptr;
+	assert(bm);
+
+	for (bit = 0, i = 0; bit < bm->size; bit++) {
+		if (numa_bitmask_isbitset(bm, bit) && is_cpu_online(bit)) {
+			cpu->map[i++] = bit;
+		}
+	}
+	cpu->nr = i;
+
+	return cpu;
+}
+
+static void cpu_map__put(struct cpu_map *cpu)
+{
+	free(cpu);
+}
 
 static inline unsigned long long nsecs(void)
 {
@@ -74,12 +129,14 @@ static void *thread_work(void *arg)
 	return NULL;
 }
 
-static int do_bench(unsigned int nthreads)
+static int do_bench(struct cpu_map *cpu, unsigned int nthreads)
 {
 	struct epoll_event ev, events[nthreads];
 	struct thread_ctx threads[nthreads];
+	pthread_attr_t thrattr;
 	struct thread_ctx *ctx;
 	int rc, epfd, nfds;
+	cpu_set_t cpuset;
 	unsigned int i;
 
 	unsigned long long epoll_calls = 0, epoll_nsecs;
@@ -101,6 +158,17 @@ static int do_bench(unsigned int nthreads)
 		rc = epoll_ctl(epfd, EPOLL_CTL_ADD, ctx->efd, &ev);
 		if (rc)
 			err(EXIT_FAILURE, "epoll_ctl");
+
+		CPU_ZERO(&cpuset);
+		CPU_SET(cpu->map[i % cpu->nr], &cpuset);
+
+		pthread_attr_init(&thrattr);
+		rc = pthread_attr_setaffinity_np(&thrattr, sizeof(cpu_set_t),
+						 &cpuset);
+		if (rc) {
+			errno = rc;
+			err(EXIT_FAILURE, "pthread_attr_setaffinity_np");
+		}
 
 		rc = pthread_create(&ctx->thread, NULL, thread_work, ctx);
 		if (rc) {
@@ -151,12 +219,21 @@ end:
 int main(int argc, char *argv[])
 {
 	unsigned int i, nthreads_arr[] = {8, 16, 32, 64, 128};
+	struct cpu_map *cpu;
 
 	(void)argc; (void)argv;
 
+	cpu = cpu_map__new();
+	if (!cpu) {
+		errno = ENOMEM;
+		err(EXIT_FAILURE, "cpu_map__new");
+	}
+
 	printf("threads  events/ms  run-time ms\n");
 	for (i = 0; i < sizeof(nthreads_arr)/sizeof(nthreads_arr[0]); i++)
-		do_bench(nthreads_arr[i]);
+		do_bench(cpu, nthreads_arr[i]);
+
+	cpu_map__put(cpu);
 
 	return 0;
 }
