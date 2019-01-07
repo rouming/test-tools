@@ -49,32 +49,38 @@ enum {
 
 #define ITERS     1000000ull
 
-#define EPOLL_USER_HEADER_SIZE  128
-#define EPOLL_USER_HEADER_MAGIC 0xeb01eb01
+
+#define EPOLL_USERPOLL_HEADER_MAGIC 0xeb01eb01
+#define EPOLL_USERPOLL_HEADER_SIZE  128
 #define EPOLL_USERPOLL 1
 
-enum {
-	EPOLL_USER_POLL_INACTIVE = 0, /* user poll disactivated */
-	EPOLL_USER_POLL_ACTIVE   = 1, /* user can continue busy polling */
+/* User item marked as removed for EPOLL_USERPOLL */
+#define EPOLLREMOVED	(1U << 27)
+
+/*
+ * Item, shared with userspace.  Unfortunately we can't embed epoll_event
+ * structure, because it is badly aligned on all 64-bit archs, except
+ * x86-64 (see EPOLL_PACKED).  sizeof(epoll_uitem) == 16
+ */
+struct epoll_uitem {
+	uint32_t ready_events;
+	uint32_t events;
+	uint64_t data;
 };
 
-struct user_epitem {
-	unsigned int ready_events;
-	struct epoll_event event;
-};
+/*
+ * Header, shared with userspace. sizeof(epoll_uheader) == 128
+ */
+struct epoll_uheader {
+	uint32_t magic;          /* epoll user header magic */
+	uint32_t header_length;  /* length of the header + items */
+	uint32_t index_length;   /* length of the index ring, always pow2 */
+	uint32_t max_items_nr;   /* max number of items */
+	uint32_t head;           /* updated by userland */
+	uint32_t tail;           /* updated by kernel */
 
-struct user_header {
-	unsigned int magic;          /* epoll user header magic */
-	unsigned int state;          /* epoll ring state */
-	unsigned int header_length;  /* length of the header + items */
-	unsigned int index_length;   /* length of the index ring */
-	unsigned int max_items_nr;   /* max num of items slots */
-	unsigned int max_index_nr;   /* max num of items indeces, always pow2 */
-	unsigned int head;           /* updated by userland */
-	unsigned int tail;           /* updated by kernel */
-	unsigned int padding[24];    /* Header size is 128 bytes */
-
-	struct user_epitem items[];
+	struct epoll_uitem items[]
+		__attribute__((aligned(EPOLL_USERPOLL_HEADER_SIZE)));
 };
 
 struct thread_ctx {
@@ -89,6 +95,11 @@ struct cpu_map {
 
 static volatile unsigned int thr_ready;
 static volatile unsigned int start;
+
+static inline unsigned int max_index_nr(struct epoll_uheader *header)
+{
+	return header->index_length >> 2;
+}
 
 static int is_cpu_online(int cpu)
 {
@@ -167,17 +178,19 @@ static void *thread_work(void *arg)
 	return NULL;
 }
 
-static inline bool read_event(struct user_header *header, unsigned int *index,
+static inline bool read_event(struct epoll_uheader *header, unsigned int *index,
 			      unsigned int idx, struct epoll_event *event)
 {
-	struct user_epitem *item;
+	struct epoll_uitem *item;
 	unsigned int *item_idx_ptr;
 	unsigned int indeces_mask;
 
-	indeces_mask = (header->max_index_nr - 1);
-	if (indeces_mask & header->max_index_nr)
+	indeces_mask = max_index_nr(header) - 1;
+	if (indeces_mask & max_index_nr(header)) {
+		assert(0);
 		/* Should be pow2, corrupted header? */
 		return false;
+	}
 
 	item_idx_ptr = &index[idx & indeces_mask];
 
@@ -187,9 +200,11 @@ static inline bool read_event(struct user_header *header, unsigned int *index,
 	while (!(idx = __atomic_load_n(item_idx_ptr, __ATOMIC_ACQUIRE)))
 		;
 
-	if (idx > header->max_items_nr)
+	if (idx > header->max_items_nr) {
+		assert(0);
 		/* Corrupted index? */
 		return false;
+	}
 
 	item = &header->items[idx - 1];
 
@@ -204,22 +219,23 @@ static inline bool read_event(struct user_header *header, unsigned int *index,
 	 * Fetch data first, if event is cleared by the kernel we drop the data
 	 * returning false.
 	 */
-	event->data = item->event.data;
+	event->data.u64 = item->data;
 	event->events = __atomic_exchange_n(&item->ready_events, 0,
 					    __ATOMIC_RELEASE);
 
-	return !!event->events;
+	return (event->events & ~EPOLLREMOVED);
 }
 
-static int uepoll_wait(struct user_header *header, unsigned int *index,
+static int uepoll_wait(struct epoll_uheader *header, unsigned int *index,
 		       int epfd, struct epoll_event *events, int maxevents)
 
 {
-	unsigned int tail, header_length, index_length;
 	unsigned int spins = 100;
+	unsigned int tail;
 	int i;
 
-	BUILD_BUG_ON(sizeof(*header) != EPOLL_USER_HEADER_SIZE);
+	BUILD_BUG_ON(sizeof(*header) != EPOLL_USERPOLL_HEADER_SIZE);
+	BUILD_BUG_ON(sizeof(header->items[0]) != 16);
 	assert(maxevents > 0);
 
 again:
@@ -231,10 +247,7 @@ again:
 	tail = READ_ONCE(header->tail);
 
 	if (header->head == tail) {
-		header_length = header->header_length;
-		index_length = header->index_length;
-
-		if (header->state == EPOLL_USER_POLL_ACTIVE && spins--)
+		if (spins--)
 			/* Busy loop a bit */
 			goto again;
 
@@ -243,20 +256,6 @@ again:
 		if (errno != ESTALE)
 			return i;
 
-		if (header_length != header->header_length) {
-			header = mremap(header, header_length, header->header_length,
-					MREMAP_MAYMOVE);
-			if (header == MAP_FAILED)
-				err(EXIT_FAILURE, "mremap(header)");
-		}
-		if (index_length != header->index_length) {
-			index = mremap(index, index_length, header->index_length,
-				       MREMAP_MAYMOVE);
-			if (index == MAP_FAILED)
-				err(EXIT_FAILURE, "mremap(index)");
-		}
-
-		assert(header->state == EPOLL_USER_POLL_ACTIVE);
 		tail = READ_ONCE(header->tail);
 		assert(header->head != tail);
 	}
@@ -272,6 +271,41 @@ again:
 	return i;
 }
 
+static void uepoll_mmap(int epfd, struct epoll_uheader **_header,
+		       unsigned int **_index)
+{
+	struct epoll_uheader *header;
+	unsigned int *index, len;
+
+	len = sysconf(_SC_PAGESIZE);
+again:
+	header = mmap(NULL, len, PROT_WRITE|PROT_READ, MAP_SHARED, epfd, 0);
+	if (header == MAP_FAILED)
+		err(EXIT_FAILURE, "mmap(header)");
+
+	if (header->header_length != len) {
+		unsigned int tmp_len = len;
+
+		len = header->header_length;
+		munmap(header, tmp_len);
+		goto again;
+	}
+	assert(header->magic == EPOLL_USERPOLL_HEADER_MAGIC);
+
+	index = mmap(NULL, header->index_length, PROT_WRITE|PROT_READ, MAP_SHARED,
+		     epfd, header->header_length);
+	if (index == MAP_FAILED)
+		err(EXIT_FAILURE, "mmap(index)");
+
+	*_header = header;
+	*_index = index;
+}
+
+static inline long epoll_create2(int flags, size_t size)
+{
+	return syscall(336, flags, size);
+}
+
 static int do_bench(struct cpu_map *cpu, unsigned int nthreads)
 {
 	struct epoll_event ev, events[nthreads];
@@ -282,16 +316,16 @@ static int do_bench(struct cpu_map *cpu, unsigned int nthreads)
 	cpu_set_t cpuset;
 	unsigned int i;
 
-	struct user_header *header;
+	struct epoll_uheader *header;
 	unsigned int *index;
 
 	unsigned long long epoll_calls = 0, epoll_nsecs;
-	unsigned long long ucnt, ucnt_sum = 0;
+	unsigned long long ucnt, ucnt_sum = 0, eagains = 0;
 
 	thr_ready = 0;
 	start = 0;
 
-	epfd = epoll_create1(EPOLL_USERPOLL);
+	epfd = epoll_create2(EPOLL_USERPOLL, nthreads);
 	if (epfd < 0)
 		err(EXIT_FAILURE, "epoll_create1");
 
@@ -326,17 +360,8 @@ static int do_bench(struct cpu_map *cpu, unsigned int nthreads)
 		}
 	}
 
-	header = mmap(NULL, 1<<12, PROT_WRITE|PROT_READ, MAP_SHARED, epfd, 0);
-	if (header == MAP_FAILED)
-		err(EXIT_FAILURE, "mmap");
-
-	assert(header->magic == EPOLL_USER_HEADER_MAGIC);
-	assert(header->header_length == 1<<12);
-
-	index = mmap(NULL, header->index_length, PROT_WRITE|PROT_READ, MAP_SHARED,
-				 epfd, header->header_length);
-	if (index == MAP_FAILED)
-		err(EXIT_FAILURE, "mmap");
+	/* Mmap all pointers */
+	uepoll_mmap(epfd, &header, &index);
 
 	while (thr_ready != nthreads)
 		;
@@ -372,6 +397,7 @@ end:
 		ctx = &threads[i];
 		pthread_join(ctx->thread, NULL);
 	}
+	close(epfd);
 
 	printf("%7d   %8lld     %8lld\n",
 	       nthreads,
@@ -383,7 +409,7 @@ end:
 
 int main(int argc, char *argv[])
 {
-	unsigned int i, nthreads_arr[] = {8, 16, 32, 64, 128};
+	unsigned int i, nthreads_arr[] = {8, 16, 32, 64, 128, 256};
 	struct cpu_map *cpu;
 
 	(void)argc; (void)argv;
