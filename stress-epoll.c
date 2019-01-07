@@ -142,6 +142,9 @@ static int do_bench(struct cpu_map *cpu, unsigned int nthreads)
 	unsigned long long epoll_calls = 0, epoll_nsecs;
 	unsigned long long ucnt, ucnt_sum = 0;
 
+	thr_ready = 0;
+	start = 0;
+
 	epfd = epoll_create1(0);
 	if (epfd < 0)
 		err(EXIT_FAILURE, "epoll_create1");
@@ -177,7 +180,7 @@ static int do_bench(struct cpu_map *cpu, unsigned int nthreads)
 		}
 	}
 
-	while (thr_ready == nthreads)
+	while (thr_ready != nthreads)
 		;
 
 	/* Signal start for all threads */
@@ -209,9 +212,9 @@ end:
 	}
 
 	printf("%7d   %8lld     %8lld\n",
-		   nthreads,
-		   ITERS*nthreads/(epoll_nsecs/1000/1000),
-		   epoll_nsecs/1000/1000);
+	       nthreads,
+	       ITERS*nthreads/(epoll_nsecs/1000/1000),
+	       epoll_nsecs/1000/1000);
 
 	return 0;
 }
