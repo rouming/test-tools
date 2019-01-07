@@ -49,13 +49,22 @@ enum {
 
 #define ITERS     1000000ull
 
-
 #define EPOLL_USERPOLL_HEADER_MAGIC 0xeb01eb01
 #define EPOLL_USERPOLL_HEADER_SIZE  128
 #define EPOLL_USERPOLL 1
 
 /* User item marked as removed for EPOLL_USERPOLL */
 #define EPOLLREMOVED	(1U << 27)
+
+
+#ifndef __NR_epoll_create2
+#define __NR_epoll_create2  428
+#endif
+
+static inline long epoll_create2(int flags, size_t size)
+{
+	return syscall(__NR_epoll_create2, flags, size);
+}
 
 /*
  * Item, shared with userspace.  Unfortunately we can't embed epoll_event
@@ -230,12 +239,14 @@ static int uepoll_wait(struct epoll_uheader *header, unsigned int *index,
 		       int epfd, struct epoll_event *events, int maxevents)
 
 {
-	unsigned int spins = 100;
+	/*
+	 * Before entering kernel we do busy wait for ~1ms, naively assuming
+	 * each iteration costs 1 cycle, 1 ns.
+	 */
+	unsigned int spins = 1000000;
 	unsigned int tail;
 	int i;
 
-	BUILD_BUG_ON(sizeof(*header) != EPOLL_USERPOLL_HEADER_SIZE);
-	BUILD_BUG_ON(sizeof(header->items[0]) != 16);
 	assert(maxevents > 0);
 
 again:
@@ -264,7 +275,7 @@ again:
 		if (read_event(header, index, header->head, &events[i]))
 			i++;
 		else
-			/* Currently we do not support event cleared by kernel */
+			/* Event can't be removed under us */
 			assert(0);
 	}
 
@@ -276,6 +287,9 @@ static void uepoll_mmap(int epfd, struct epoll_uheader **_header,
 {
 	struct epoll_uheader *header;
 	unsigned int *index, len;
+
+	BUILD_BUG_ON(sizeof(*header) != EPOLL_USERPOLL_HEADER_SIZE);
+	BUILD_BUG_ON(sizeof(header->items[0]) != 16);
 
 	len = sysconf(_SC_PAGESIZE);
 again:
@@ -301,11 +315,6 @@ again:
 	*_index = index;
 }
 
-static inline long epoll_create2(int flags, size_t size)
-{
-	return syscall(336, flags, size);
-}
-
 static int do_bench(struct cpu_map *cpu, unsigned int nthreads)
 {
 	struct epoll_event ev, events[nthreads];
@@ -327,7 +336,7 @@ static int do_bench(struct cpu_map *cpu, unsigned int nthreads)
 
 	epfd = epoll_create2(EPOLL_USERPOLL, nthreads);
 	if (epfd < 0)
-		err(EXIT_FAILURE, "epoll_create1");
+		err(EXIT_FAILURE, "epoll_create2");
 
 	for (i = 0; i < nthreads; i++) {
 		ctx = &threads[i];
