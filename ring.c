@@ -35,6 +35,8 @@
 #include <string.h>
 #include <limits.h>
 #include <errno.h>
+#include <err.h>
+#include <numa.h>
 
 #ifndef bool
 #define bool _Bool
@@ -47,24 +49,12 @@ enum {
 #define BUILD_BUG_ON(condition) ((void )sizeof(char [1 - 2*!!(condition)]))
 #define READ_ONCE(v) (*(volatile typeof(v)*)&(v))
 
-#define smp_rmb() asm volatile("lfence":::"memory")
-#define smp_wmb() asm volatile("sfence":::"memory")
-
 #define EPOLL_USER_HEADER_SIZE  128
-#define EPOLL_USER_HEADER_MAGIC 0xf00dce11
+#define EPOLL_USER_HEADER_MAGIC 0xeb01eb01
 
 
 enum {
-	UNSIGNALED = 0,
-	SIGNALED   = 1,
-	READING    = 2,
-	WRITING    = 3,
-
-	ALL        = (SIGNALED | READING | WRITING)
-};
-
-enum {
-	EPOLL_USER_POLL_INACTIVE = 0, /* busy poll is inactive, call epoll_wait() */
+	EPOLL_USER_POLL_INACTIVE = 0, /* user poll disactivated */
 	EPOLL_USER_POLL_ACTIVE   = 1, /* user can continue busy polling */
 };
 
@@ -72,20 +62,20 @@ enum {
 #pragma GCC diagnostic warning "-Wpadded"
 
 struct user_epitem {
-	unsigned active_events;
+	unsigned int ready_events;
 	struct epoll_event event;
 };
 
 struct user_header {
-	unsigned magic;          /* epoll user header magic */
-	unsigned state;          /* epoll ring state */
-	unsigned header_length;  /* length of the header + items */
-	unsigned index_length;   /* length of the index ring */
-	unsigned max_items_nr;   /* max number of items slots */
-	unsigned max_indeces_nr; /* max number of items indeces, always pow2 */
-	unsigned head;           /* updated by userland */
-	unsigned tail;           /* updated by kernel */
-	unsigned padding[24];    /* Header size is 128 bytes */
+	unsigned int magic;          /* epoll user header magic */
+	unsigned int state;          /* epoll ring state */
+	unsigned int header_length;  /* length of the header + items */
+	unsigned int index_length;   /* length of the index ring */
+	unsigned int max_items_nr;   /* max num of items slots */
+	unsigned int max_index_nr;   /* max num of items indeces, always pow2 */
+	unsigned int head;           /* updated by userland */
+	unsigned int tail;           /* updated by kernel */
+	unsigned int padding[24];    /* Header size is 128 bytes */
 
 	struct user_epitem items[];
 };
@@ -97,7 +87,7 @@ struct ring {
 	unsigned           *user_itemsindex;
 
 	unsigned items_nr;
-	unsigned max_indeces_nr;
+	unsigned max_index_nr;
 };
 
 static inline bool update_event__kernel(struct ring *ring, unsigned bit,
@@ -109,16 +99,16 @@ static inline bool update_event__kernel(struct ring *ring, unsigned bit,
 
 	assert(sizeof(struct user_epitem) == 16);
 	assert(!((uintptr_t)item & 15));
-	assert(!((uintptr_t)&item->active_events & 15));
+	assert(!((uintptr_t)&item->ready_events & 15));
 
-	return !!__atomic_fetch_or(&item->active_events, events, __ATOMIC_ACQUIRE);
+	return !!__atomic_fetch_or(&item->ready_events, events, __ATOMIC_ACQUIRE);
 }
 
 static inline void add_event__kernel(struct ring *ring, unsigned bit)
 {
 	unsigned i, *item_idx, indeces_mask;
 
-	indeces_mask = (ring->max_indeces_nr - 1);
+	indeces_mask = (ring->max_index_nr - 1);
 	i = __atomic_fetch_add(&ring->user_header->tail, 1, __ATOMIC_ACQUIRE);
 	item_idx = &ring->user_itemsindex[i & indeces_mask];
 
@@ -139,7 +129,7 @@ static inline bool free_event__kernel(struct ring *ring, unsigned bit)
 
 	item = &ring->user_header->items[bit];
 
-	return !__atomic_exchange_n(&item->active_events, 0, __ATOMIC_RELAXED);
+	return !__atomic_exchange_n(&item->ready_events, 0, __ATOMIC_RELAXED);
 }
 
 
@@ -151,8 +141,8 @@ static inline bool read_event__user(struct ring *ring, unsigned idx,
 	unsigned *item_idx_ptr;
 	unsigned indeces_mask;
 
-	indeces_mask = (header->max_indeces_nr - 1);
-	if (indeces_mask & header->max_indeces_nr)
+	indeces_mask = (header->max_index_nr - 1);
+	if (indeces_mask & header->max_index_nr)
 		/* Should be pow2, corrupted header? */
 		return false;
 
@@ -182,16 +172,13 @@ static inline bool read_event__user(struct ring *ring, unsigned idx,
 	 * returning false.
 	 */
 	event->data = item->event.data;
-	event->events = __atomic_exchange_n(&item->active_events, 0,
+	event->events = __atomic_exchange_n(&item->ready_events, 0,
 					    __ATOMIC_RELEASE);
 
 	return !!event->events;
 }
 
-
 #define ITERS 10000000ull
-#define THRDS 256
-
 
 struct uepollfd {
 	struct ring ring;
@@ -209,9 +196,62 @@ struct thread_ctx {
 	struct ueventfd efd;
 };
 
-static struct thread_ctx threads[THRDS];
+struct cpu_map {
+	unsigned int nr;
+	unsigned int map[];
+};
+
 static volatile int thr_ready;
 static volatile int start;
+
+static int is_cpu_online(int cpu)
+{
+	char buf[64];
+	char online;
+	FILE *f;
+	int rc;
+
+	snprintf(buf, sizeof(buf), "/sys/devices/system/cpu/cpu%d/online", cpu);
+	f = fopen(buf, "r");
+	if (!f)
+		return 1;
+
+	rc = fread(&online, 1, 1, f);
+	assert(rc == 1);
+	fclose(f);
+
+	return (char)online == '1';
+}
+
+static struct cpu_map *cpu_map__new(void)
+{
+	struct cpu_map *cpu;
+	struct bitmask *bm;
+
+	int i, bit, cpus_nr;
+
+	cpus_nr = numa_num_possible_cpus();
+	cpu = calloc(1, sizeof(*cpu) + sizeof(cpu->map[0]) * cpus_nr);
+	if (!cpu)
+		return NULL;
+
+	bm = numa_all_cpus_ptr;
+	assert(bm);
+
+	for (bit = 0, i = 0; bit < bm->size; bit++) {
+		if (numa_bitmask_isbitset(bm, bit) && is_cpu_online(bit)) {
+			cpu->map[i++] = bit;
+		}
+	}
+	cpu->nr = i;
+
+	return cpu;
+}
+
+static void cpu_map__put(struct cpu_map *cpu)
+{
+	free(cpu);
+}
 
 static inline unsigned long long nsecs(void)
 {
@@ -240,7 +280,7 @@ static void uepoll_create(struct uepollfd *epfd)
 	hdr->header_length = size;
 	hdr->index_length = size;
 	hdr->max_items_nr = (size - sizeof(*hdr)) / sizeof(hdr->items[0]);
-	hdr->max_indeces_nr = size / sizeof(*itemsindex);
+	hdr->max_index_nr = size / sizeof(*itemsindex);
 
 	itemsindex = aligned_alloc(EPOLL_USER_HEADER_SIZE, size);
 	assert(itemsindex);
@@ -248,7 +288,7 @@ static void uepoll_create(struct uepollfd *epfd)
 
 	epfd->ring.user_header = hdr;
 	epfd->ring.user_itemsindex = itemsindex;
-	epfd->ring.max_indeces_nr = hdr->max_indeces_nr;
+	epfd->ring.max_index_nr = hdr->max_index_nr;
 }
 
 static void uepoll_ctl(struct uepollfd *epfd, int op, struct ueventfd *efd,
@@ -269,7 +309,7 @@ static void uepoll_ctl(struct uepollfd *epfd, int op, struct ueventfd *efd,
 
 	/* That is racy with possible access from userspace, but we do not care */
 	item = &ring->user_header->items[efd->efd_bit];
-	item->active_events = 0;
+	item->ready_events = 0;
 	item->event = *event;
 }
 
@@ -394,9 +434,11 @@ static void *thread_work(void *arg)
 	return NULL;
 }
 
-int main(int argc, char *argv[])
+static int do_bench(struct cpu_map *cpu, unsigned int nthreads)
 {
-	struct epoll_event ev, events[THRDS];
+
+	struct epoll_event ev, events[nthreads];
+	struct thread_ctx threads[nthreads];
 	struct thread_ctx *ctx;
 	struct uepollfd epfd;
 	int i, rc, nfds;
@@ -404,9 +446,12 @@ int main(int argc, char *argv[])
 	unsigned long long epoll_calls = 0, epoll_nsecs;
 	unsigned long long ucnt, ucnt_sum = 0;
 
+	thr_ready = 0;
+	start = 0;
+
 	uepoll_create(&epfd);
 
-	for (i = 0; i < THRDS; i++) {
+	for (i = 0; i < nthreads; i++) {
 		ctx = &threads[i];
 
 		ueventfd_create(&ctx->efd, 0);
@@ -419,7 +464,7 @@ int main(int argc, char *argv[])
 		assert(rc == 0);
 	}
 
-	while (thr_ready == THRDS)
+	while (thr_ready != nthreads)
 		;
 
 	/* Signal start for all threads */
@@ -427,7 +472,7 @@ int main(int argc, char *argv[])
 
 	epoll_nsecs = nsecs();
 	while (1) {
-		nfds = uepoll_wait(&epfd, events, THRDS);
+		nfds = uepoll_wait(&epfd, events, nthreads);
 		if (nfds == -EAGAIN)
 			/* Busy wait */
 			continue;
@@ -442,23 +487,44 @@ int main(int argc, char *argv[])
 				continue;
 			assert(rc == sizeof(ucnt));
 			ucnt_sum += ucnt;
-			if (ucnt_sum == THRDS * ITERS)
+			if (ucnt_sum == nthreads * ITERS)
 				goto end;
 		}
 	}
 end:
 	epoll_nsecs = nsecs() - epoll_nsecs;
 
-	for (i = 0; i < THRDS; i++) {
+	for (i = 0; i < nthreads; i++) {
 		ctx = &threads[i];
 		pthread_join(ctx->thread, NULL);
 	}
 
-	printf("threads  events/ms  run-time ms\n");
 	printf("%7d   %8lld     %8lld\n",
-		   THRDS,
-		   ITERS*THRDS/(epoll_nsecs/1000/1000),
-		   epoll_nsecs/1000/1000);
+	       nthreads,
+	       ITERS*nthreads/(epoll_nsecs/1000/1000),
+	       epoll_nsecs/1000/1000);
+
+	return 0;
+}
+
+int main(int argc, char *argv[])
+{
+	unsigned int i, nthreads_arr[] = {8, 16, 32, 64, 128, 256};
+	struct cpu_map *cpu;
+
+	(void)argc; (void)argv;
+
+	cpu = cpu_map__new();
+	if (!cpu) {
+		errno = ENOMEM;
+		err(EXIT_FAILURE, "cpu_map__new");
+	}
+
+	printf("threads  events/ms  run-time ms\n");
+	for (i = 0; i < sizeof(nthreads_arr)/sizeof(nthreads_arr[0]); i++)
+		do_bench(cpu, nthreads_arr[i]);
+
+	cpu_map__put(cpu);
 
 	return 0;
 }
