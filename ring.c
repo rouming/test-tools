@@ -19,7 +19,7 @@
  *
  *  Purpose of the tool is to emulate eventfd and epoll_wait in userspace.
  *
- *  $ gcc -o ring ring.c -O2 -Wall -lpthread
+ *  $ gcc -o ring ring.c -O2 -Wall -lpthread -lnuma
  *
  */
 
@@ -75,7 +75,9 @@ struct user_header {
 	unsigned int max_index_nr;   /* max num of items indeces, always pow2 */
 	unsigned int head;           /* updated by userland */
 	unsigned int tail;           /* updated by kernel */
-	unsigned int padding[24];    /* Header size is 128 bytes */
+	unsigned long long counter;
+
+	unsigned int padding[22];    /* Header size is 128 bytes */
 
 	struct user_epitem items[];
 };
@@ -104,16 +106,69 @@ static inline bool update_event__kernel(struct ring *ring, unsigned bit,
 	return !!__atomic_fetch_or(&item->ready_events, events, __ATOMIC_ACQUIRE);
 }
 
+static inline unsigned int cnt_to_monotonic(unsigned long long cnt)
+{
+	return (cnt >> 32);
+}
+
+static inline unsigned int cnt_to_advance(unsigned long long cnt)
+{
+	return (cnt >> 16) & 0xffff;
+}
+
+static inline unsigned int cnt_to_refs(unsigned long long cnt)
+{
+	return (cnt & 0xffff);
+}
+
+#define MONOTONIC_MASK ((1ull<<32)-1)
+#define COUNTER_SINGLE ((1ull<<32)|(1ull<<16)|1ull)
+
 static inline void add_event__kernel(struct ring *ring, unsigned bit)
 {
-	unsigned i, *item_idx, indeces_mask;
+	unsigned int *item_idx, indeces_mask, advance;
+	unsigned long long old, cnt;
 
 	indeces_mask = (ring->max_index_nr - 1);
-	i = __atomic_fetch_add(&ring->user_header->tail, 1, __ATOMIC_ACQUIRE);
-	item_idx = &ring->user_itemsindex[i & indeces_mask];
+	cnt = __atomic_fetch_add(&ring->user_header->counter,
+				 COUNTER_SINGLE, __ATOMIC_ACQUIRE);
+
+	item_idx = &ring->user_itemsindex[cnt_to_monotonic(cnt) & indeces_mask];
 
 	/* Update data */
 	*item_idx = bit + 1;
+
+	cnt = ring->user_header->counter;
+	do {
+		old = cnt;
+		if (cnt_to_refs(cnt) == 1) {
+			/* We are the last, we can advance the tail */
+			advance = cnt_to_advance(cnt);
+			assert(advance);
+			cnt &= ~MONOTONIC_MASK;
+		} else {
+			/* Someone else will advance, just drop the ref */
+			advance = 0;
+			cnt -= 1;
+		}
+
+	} while ((cnt = __sync_val_compare_and_swap(
+			  &ring->user_header->counter,
+			  old, cnt)) != old);
+
+	if (advance) {
+		/*
+		 * Advance the tail.  Tail is shared with userspace, thus
+		 * we can't use kernel atomic_t for just atomic inc, so use
+		 * cmpxchg().  Sigh.
+		 */
+		unsigned int oldt = 0, tail = ring->user_header->tail;
+		do {
+			oldt = tail;
+		} while ((tail = __sync_val_compare_and_swap(
+				  &ring->user_header->tail,
+				  oldt, oldt + advance)) != oldt);
+	}
 }
 
 /**
@@ -147,12 +202,7 @@ static inline bool read_event__user(struct ring *ring, unsigned idx,
 		return false;
 
 	item_idx_ptr = &ring->user_itemsindex[idx & indeces_mask];
-
-	/*
-	 * Spin here till we see valid index
-	 */
-	while (!(idx = __atomic_load_n(item_idx_ptr, __ATOMIC_ACQUIRE)))
-		;
+	idx = *item_idx_ptr;
 
 	if (idx > header->max_items_nr)
 		/* Corrupted index? */
