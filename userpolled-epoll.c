@@ -58,7 +58,7 @@ enum {
 
 
 #ifndef __NR_epoll_create2
-#define __NR_epoll_create2  428
+#define __NR_epoll_create2  437
 #endif
 
 static inline long epoll_create2(int flags, size_t size)
@@ -203,26 +203,15 @@ static inline bool read_event(struct epoll_uheader *header, unsigned int *index,
 
 	item_idx_ptr = &index[idx & indeces_mask];
 
-	/*
-	 * Spin here till we see valid index
-	 */
-	while (!(idx = __atomic_load_n(item_idx_ptr, __ATOMIC_ACQUIRE)))
-		;
-
-	if (idx > header->max_items_nr) {
+	/* Load index */
+	idx = __atomic_load_n(item_idx_ptr, __ATOMIC_ACQUIRE);
+	if (idx >= header->max_items_nr) {
 		assert(0);
 		/* Corrupted index? */
 		return false;
 	}
 
-	item = &header->items[idx - 1];
-
-	/*
-	 * Mark index as invalid, that is for userspace only, kernel does not care
-	 * and will refill this pointer only when observes that event is cleared,
-	 * which happens below.
-	 */
-	*item_idx_ptr = 0;
+	item = &header->items[idx];
 
 	/*
 	 * Fetch data first, if event is cleared by the kernel we drop the data
@@ -313,6 +302,19 @@ again:
 
 	*_header = header;
 	*_index = index;
+}
+
+static void uepoll_munmap(struct epoll_uheader *header,
+			  unsigned int *index)
+{
+	int rc;
+
+	rc = munmap(index, header->index_length);
+	if (rc)
+		warn("munmap(index)");
+	rc = munmap(header, header->header_length);
+	if (rc)
+		warn("munmap(header)");
 }
 
 static int do_bench(struct cpu_map *cpu, unsigned int nthreads)
@@ -406,6 +408,7 @@ end:
 		ctx = &threads[i];
 		pthread_join(ctx->thread, NULL);
 	}
+	uepoll_munmap(header, index);
 	close(epfd);
 
 	printf("%7d   %8lld     %8lld\n",

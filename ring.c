@@ -72,7 +72,7 @@ struct user_header {
 	unsigned int header_length;  /* length of the header + items */
 	unsigned int index_length;   /* length of the index ring */
 	unsigned int max_items_nr;   /* max num of items slots */
-	unsigned int max_index_nr;   /* max num of items indeces, always pow2 */
+	unsigned int max_index_nr;   /* max num of items indices, always pow2 */
 	unsigned int head;           /* updated by userland */
 	unsigned int tail;           /* updated by kernel */
 	unsigned long long counter;
@@ -126,17 +126,17 @@ static inline unsigned int cnt_to_refs(unsigned long long cnt)
 
 static inline void add_event__kernel(struct ring *ring, unsigned bit)
 {
-	unsigned int *item_idx, indeces_mask, advance;
+	unsigned int *item_idx, indices_mask, advance;
 	unsigned long long old, cnt;
 
-	indeces_mask = (ring->max_index_nr - 1);
+	indices_mask = (ring->max_index_nr - 1);
 	cnt = __atomic_fetch_add(&ring->user_header->counter,
 				 COUNTER_SINGLE, __ATOMIC_ACQUIRE);
 
-	item_idx = &ring->user_itemsindex[cnt_to_monotonic(cnt) & indeces_mask];
+	item_idx = &ring->user_itemsindex[cnt_to_monotonic(cnt) & indices_mask];
 
 	/* Update data */
-	*item_idx = bit + 1;
+	*item_idx = bit;
 
 	cnt = ring->user_header->counter;
 	do {
@@ -194,28 +194,22 @@ static inline bool read_event__user(struct ring *ring, unsigned idx,
 	struct user_header *header = ring->user_header;
 	struct user_epitem *item;
 	unsigned *item_idx_ptr;
-	unsigned indeces_mask;
+	unsigned indices_mask;
 
-	indeces_mask = (header->max_index_nr - 1);
-	if (indeces_mask & header->max_index_nr)
+	indices_mask = (header->max_index_nr - 1);
+	if (indices_mask & header->max_index_nr)
 		/* Should be pow2, corrupted header? */
 		return false;
 
-	item_idx_ptr = &ring->user_itemsindex[idx & indeces_mask];
-	idx = *item_idx_ptr;
+	item_idx_ptr = &ring->user_itemsindex[idx & indices_mask];
 
-	if (idx > header->max_items_nr)
+	/* Load index */
+	idx = __atomic_load_n(item_idx_ptr, __ATOMIC_ACQUIRE);
+	if (idx >= header->max_items_nr)
 		/* Corrupted index? */
 		return false;
 
-	item = &header->items[idx - 1];
-
-	/*
-	 * Mark index as invalid, that is for userspace only, kernel does not care
-	 * and will refill this pointer only when observes that event is cleared,
-	 * which happens below.
-	 */
-	*item_idx_ptr = 0;
+	item = &header->items[idx];
 
 	/*
 	 * Fetch data first, if event is cleared by the kernel we drop the data
